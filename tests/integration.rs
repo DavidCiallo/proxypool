@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use ip_proxy_pool::AuthConfig;
 
 /// 启动一个 mock 上游 SOCKS5 服务器（循环 accept）
 async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -163,7 +164,7 @@ async fn test_socks5_end_to_end_with_mock_upstream() {
 
     let sp = pool.clone();
     let sh = tokio::spawn(async move {
-        ip_proxy_pool::socks5::Socks5Server::new(sp, Arc::new(RwLock::new(HashSet::new()))).start(port).await.unwrap();
+        ip_proxy_pool::socks5::Socks5Server::new(sp, Arc::new(RwLock::new(HashSet::new())), AuthConfig { username: String::new(), password: String::new() }).start(port).await.unwrap();
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -196,7 +197,7 @@ async fn test_socks5_end_to_end_unavailable_upstream() {
 
     let sp = pool.clone();
     let sh = tokio::spawn(async move {
-        ip_proxy_pool::socks5::Socks5Server::new(sp, Arc::new(RwLock::new(HashSet::new()))).start(port).await.unwrap();
+        ip_proxy_pool::socks5::Socks5Server::new(sp, Arc::new(RwLock::new(HashSet::new())), AuthConfig { username: String::new(), password: String::new() }).start(port).await.unwrap();
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -207,9 +208,9 @@ async fn test_socks5_end_to_end_unavailable_upstream() {
 
     assert!(result.is_err(), "上游不可达时应返回错误");
 
-    // 验证 pool 中该端口被标记为不可用
+    // 单次失败不再标记不可用，由健康检查统一管理
     let addr = pool.get_proxy_address(port).await;
-    assert!(addr.is_none(), "上游失败后端口应被标记为不可用");
+    assert!(addr.is_some(), "单次失败不应标记不可用，应由健康检查处理");
 
     sh.abort();
 }

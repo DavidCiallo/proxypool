@@ -5,7 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn, debug};
 
 use crate::pool::IpPool;
-use crate::BypassList;
+use crate::{AuthConfig, BypassList};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_NO_AUTH: u8 = 0x00;
@@ -20,11 +20,12 @@ const SOCKS5_REP_HOST_UNREACHABLE: u8 = 0x04;
 pub struct Socks5Server {
     pool: Arc<IpPool>,
     bypass: BypassList,
+    auth: AuthConfig,
 }
 
 impl Socks5Server {
-    pub fn new(pool: Arc<IpPool>, bypass: BypassList) -> Self {
-        Self { pool, bypass }
+    pub fn new(pool: Arc<IpPool>, bypass: BypassList, auth: AuthConfig) -> Self {
+        Self { pool, bypass, auth }
     }
 
     pub async fn start(&self, port: u16) -> anyhow::Result<()> {
@@ -34,8 +35,9 @@ impl Socks5Server {
             let (stream, addr) = listener.accept().await?;
             let pool = self.pool.clone();
             let bypass = self.bypass.clone();
+            let auth = self.auth.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(stream, addr, pool, bypass, port).await {
+                if let Err(e) = Self::handle_client(stream, addr, pool, bypass, auth, port).await {
                     debug!("Client {} disconnected: {}", addr, e);
                 }
             });
@@ -57,6 +59,7 @@ impl Socks5Server {
         addr: SocketAddr,
         pool: Arc<IpPool>,
         bypass: BypassList,
+        auth: AuthConfig,
         local_port: u16,
     ) -> anyhow::Result<()> {
         debug!("New connection from {}", addr);
@@ -69,13 +72,54 @@ impl Socks5Server {
             anyhow::bail!("Unsupported SOCKS version: {}", buf[0]);
         }
 
-        // Read methods
+        // Read client methods
         let nmethods = buf[1];
         let mut methods = vec![0u8; nmethods as usize];
         stream.read_exact(&mut methods).await?;
 
-        // Reply with no auth
-        stream.write_all(&[SOCKS5_VERSION, SOCKS5_NO_AUTH]).await?;
+        if auth.is_required() {
+            // 要求认证：客户端必须支持 USERPASS
+            if !methods.contains(&SOCKS5_USERPASS_AUTH) {
+                // 客户端不支持用户名密码认证，回复 0xFF（无可接受方法）
+                stream.write_all(&[SOCKS5_VERSION, 0xFF]).await?;
+                anyhow::bail!("Client does not support username/password auth");
+            }
+            // 选择 USERPASS
+            stream.write_all(&[SOCKS5_VERSION, SOCKS5_USERPASS_AUTH]).await?;
+
+            // 读取认证请求: VER ULEN USER PLEN PASS
+            let mut auth_ver = [0u8; 1];
+            stream.read_exact(&mut auth_ver).await?;
+            if auth_ver[0] != 0x01 {
+                anyhow::bail!("Unsupported auth version: {}", auth_ver[0]);
+            }
+
+            let mut ulen = [0u8; 1];
+            stream.read_exact(&mut ulen).await?;
+            let mut username = vec![0u8; ulen[0] as usize];
+            stream.read_exact(&mut username).await?;
+
+            let mut plen = [0u8; 1];
+            stream.read_exact(&mut plen).await?;
+            let mut password = vec![0u8; plen[0] as usize];
+            stream.read_exact(&mut password).await?;
+
+            let username = String::from_utf8(username).unwrap_or_default();
+            let password = String::from_utf8(password).unwrap_or_default();
+
+            if username != auth.username || password != auth.password {
+                // 认证失败
+                stream.write_all(&[0x01, 0x01]).await?;
+                anyhow::bail!("Auth failed for user: {}", username);
+            }
+
+            // 认证成功
+            stream.write_all(&[0x01, 0x00]).await?;
+            debug!("Auth success for user: {}", username);
+        } else {
+            // 不需要认证
+            stream.write_all(&[SOCKS5_VERSION, SOCKS5_NO_AUTH]).await?;
+        }
 
         // Read request
         let mut header = [0u8; 4];
@@ -146,7 +190,6 @@ impl Socks5Server {
             Some(addr) => addr,
             None => {
                 Self::send_reply(&mut stream, SOCKS5_REP_HOST_UNREACHABLE).await?;
-                pool.mark_unavailable(local_port).await;
                 anyhow::bail!("No proxy available for port {}", local_port);
             }
         };
@@ -158,9 +201,7 @@ impl Socks5Server {
         let mut upstream = match TcpStream::connect(&upstream_addr).await {
             Ok(stream) => stream,
             Err(e) => {
-                warn!("Failed to connect to upstream {}: {}", upstream_addr, e);
                 Self::send_reply(&mut stream, SOCKS5_REP_HOST_UNREACHABLE).await?;
-                pool.mark_unavailable(local_port).await;
                 anyhow::bail!("Upstream connection failed: {}", e);
             }
         };
@@ -175,7 +216,6 @@ impl Socks5Server {
         ).await {
             warn!("Upstream handshake failed for {}:{}: {}", dest_addr, dest_port, e);
             Self::send_reply(&mut stream, SOCKS5_REP_HOST_UNREACHABLE).await?;
-            pool.mark_unavailable(local_port).await;
             anyhow::bail!("Upstream handshake failed: {}", e);
         }
 
@@ -383,7 +423,7 @@ mod tests {
 
         let sp = pool.clone();
         let sh = tokio::spawn(async move {
-            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new()))).start(20001).await.unwrap();
+            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new())), AuthConfig { username: String::new(), password: String::new() }).start(20001).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -412,7 +452,7 @@ mod tests {
 
         let sp = pool.clone();
         let sh = tokio::spawn(async move {
-            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new()))).start(20002).await.unwrap();
+            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new())), AuthConfig { username: String::new(), password: String::new() }).start(20002).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -443,7 +483,7 @@ mod tests {
 
         let sp = pool.clone();
         let sh = tokio::spawn(async move {
-            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new()))).start(20003).await.unwrap();
+            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new())), AuthConfig { username: String::new(), password: String::new() }).start(20003).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -473,7 +513,7 @@ mod tests {
 
         let sp = pool.clone();
         let sh = tokio::spawn(async move {
-            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new()))).start(20004).await.unwrap();
+            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new())), AuthConfig { username: String::new(), password: String::new() }).start(20004).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -499,7 +539,7 @@ mod tests {
 
         let sp = pool.clone();
         let sh = tokio::spawn(async move {
-            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new()))).start(20005).await.unwrap();
+            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new())), AuthConfig { username: String::new(), password: String::new() }).start(20005).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -536,7 +576,7 @@ mod tests {
 
         let sp = pool.clone();
         let sh = tokio::spawn(async move {
-            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new()))).start(20006).await.unwrap();
+            Socks5Server::new(sp, Arc::new(RwLock::new(std::collections::HashSet::new())), AuthConfig { username: String::new(), password: String::new() }).start(20006).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 

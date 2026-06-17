@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use ip_proxy_pool::http::HttpProxyServer;
 use ip_proxy_pool::pool::IpPool;
 use ip_proxy_pool::socks5::Socks5Server;
-use ip_proxy_pool::BypassList;
+use ip_proxy_pool::{AuthConfig, BypassList};
 
 #[derive(Parser, Debug)]
 #[command(name = "ip-proxy-pool", about = "SOCKS5/HTTP proxy pool with auto IP rotation")]
@@ -20,7 +20,7 @@ struct Args {
     port_start: u16,
 
     /// 结束端口
-    #[arg(long, default_value = "10010")]
+    #[arg(long, default_value = "10029")]
     port_end: u16,
 
     /// IP 获取 API URL（或设置 FETCH_URL 环境变量）
@@ -42,10 +42,20 @@ struct Args {
     /// 初始白名单域名，逗号分隔
     #[arg(long, value_delimiter = ',')]
     bypass: Vec<String>,
+
+    /// 本地代理用户名（或设置 LOCAL_USERNAME 环境变量）
+    #[arg(long)]
+    local_username: Option<String>,
+
+    /// 本地代理密码（或设置 LOCAL_PASSWORD 环境变量）
+    #[arg(long)]
+    local_password: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -66,6 +76,25 @@ async fn main() -> anyhow::Result<()> {
     let proxy_password = args.proxy_password
         .or_else(|| std::env::var("PROXY_PASSWORD").ok())
         .expect("PROXY_PASSWORD is required (set env var or use --proxy-password)");
+
+    let local_username = args.local_username
+        .or_else(|| std::env::var("LOCAL_USERNAME").ok())
+        .unwrap_or_default();
+
+    let local_password = args.local_password
+        .or_else(|| std::env::var("LOCAL_PASSWORD").ok())
+        .unwrap_or_default();
+
+    let auth = AuthConfig {
+        username: local_username,
+        password: local_password,
+    };
+
+    if auth.is_required() {
+        info!("Local proxy auth enabled: username={}", auth.username);
+    } else {
+        info!("Local proxy auth disabled (no LOCAL_USERNAME set)");
+    }
 
     info!("Starting IP Proxy Pool");
 
@@ -103,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
 
     for port in args.port_start..=args.port_end {
         // SOCKS5 on each port
-        let socks_server = Socks5Server::new(pool.clone(), bypass.clone());
+        let socks_server = Socks5Server::new(pool.clone(), bypass.clone(), auth.clone());
         let handle = tokio::spawn(async move {
             if let Err(e) = socks_server.start(port).await {
                 error!("SOCKS5 server on port {} failed: {}", port, e);
@@ -113,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
 
         // HTTP on each port + 1000
         let http_port = port + 1000;
-        let http_server = HttpProxyServer::new(pool.clone(), bypass.clone());
+        let http_server = HttpProxyServer::new(pool.clone(), bypass.clone(), auth.clone());
         let handle = tokio::spawn(async move {
             if let Err(e) = http_server.start(http_port, port).await {
                 error!("HTTP server on port {} failed: {}", http_port, e);

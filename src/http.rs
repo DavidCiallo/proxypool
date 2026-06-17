@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn, debug};
 
 use crate::pool::IpPool;
-use crate::BypassList;
+use crate::{AuthConfig, BypassList};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_NO_AUTH: u8 = 0x00;
@@ -20,11 +20,12 @@ const SOCKS5_REP_FAILURE: u8 = 0x01;
 pub struct HttpProxyServer {
     pool: Arc<IpPool>,
     bypass: BypassList,
+    auth: AuthConfig,
 }
 
 impl HttpProxyServer {
-    pub fn new(pool: Arc<IpPool>, bypass: BypassList) -> Self {
-        Self { pool, bypass }
+    pub fn new(pool: Arc<IpPool>, bypass: BypassList, auth: AuthConfig) -> Self {
+        Self { pool, bypass, auth }
     }
 
     pub async fn start(&self, port: u16, socks_port: u16) -> anyhow::Result<()> {
@@ -34,8 +35,9 @@ impl HttpProxyServer {
             let (stream, addr) = listener.accept().await?;
             let pool = self.pool.clone();
             let bypass = self.bypass.clone();
+            let auth = self.auth.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(stream, addr, pool, bypass, port, socks_port).await {
+                if let Err(e) = Self::handle_client(stream, addr, pool, bypass, auth, port, socks_port).await {
                     debug!("HTTP client {} disconnected: {}", addr, e);
                 }
             });
@@ -51,6 +53,7 @@ impl HttpProxyServer {
         _addr: SocketAddr,
         pool: Arc<IpPool>,
         bypass: BypassList,
+        auth: AuthConfig,
         _local_port: u16,
         socks_port: u16,
     ) -> anyhow::Result<()> {
@@ -72,38 +75,58 @@ impl HttpProxyServer {
         let method = parts[0].to_string();
         let target = parts[1].to_string();
 
-        if method.eq_ignore_ascii_case("CONNECT") {
-            loop {
-                let mut line = String::new();
-                buf_reader.read_line(&mut line).await?;
-                if line.trim_end_matches("\r\n").is_empty() {
-                    break;
-                }
+        // 读取所有 header
+        let mut headers = Vec::new();
+        let mut content_length: usize = 0;
+        loop {
+            let mut line = String::new();
+            buf_reader.read_line(&mut line).await?;
+            let trimmed = line.trim_end_matches("\r\n");
+            if trimmed.is_empty() {
+                break;
             }
-            drop(buf_reader);
+            if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+                content_length = val.trim().parse().unwrap_or(0);
+            }
+            headers.push(line);
+        }
+
+        // 认证检查
+        if auth.is_required() {
+            let authorized = headers.iter().any(|h| {
+                let lower = h.to_lowercase();
+                if lower.starts_with("proxy-authorization:") {
+                    if let Some(encoded) = h.split(':').nth(1) {
+                        let encoded = encoded.trim().strip_prefix("Basic").unwrap_or("").trim();
+                        if let Ok(decoded) = base64_decode(encoded) {
+                            if let Some((user, pass)) = decoded.split_once(':') {
+                                return user == auth.username && pass == auth.password;
+                            }
+                        }
+                    }
+                    false
+                } else {
+                    false
+                }
+            });
+
+            if !authorized {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n"
+                ).await?;
+                anyhow::bail!("Proxy auth required");
+            }
+        }
+
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            buf_reader.read_exact(&mut body).await?;
+        }
+        drop(buf_reader);
+
+        if method.eq_ignore_ascii_case("CONNECT") {
             Self::handle_connect(stream, &target, pool, bypass, socks_port).await
         } else {
-            let mut headers = Vec::new();
-            let mut content_length: usize = 0;
-            loop {
-                let mut line = String::new();
-                buf_reader.read_line(&mut line).await?;
-                let trimmed = line.trim_end_matches("\r\n");
-                if trimmed.is_empty() {
-                    break;
-                }
-                if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-                    content_length = val.trim().parse().unwrap_or(0);
-                }
-                headers.push(line);
-            }
-
-            let mut body = vec![0u8; content_length];
-            if content_length > 0 {
-                buf_reader.read_exact(&mut body).await?;
-            }
-            drop(buf_reader);
-
             let (reader, mut writer) = stream.into_split();
             Self::handle_http(reader, &mut writer, &method, &target, &headers, &body, pool, bypass, socks_port).await
         }
@@ -143,7 +166,6 @@ impl HttpProxyServer {
             Some(addr) => addr,
             None => {
                 let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                pool.mark_unavailable(socks_port).await;
                 anyhow::bail!("No proxy available for port {}", socks_port);
             }
         };
@@ -153,9 +175,7 @@ impl HttpProxyServer {
         let mut upstream = match TcpStream::connect(&upstream_addr).await {
             Ok(s) => s,
             Err(e) => {
-                warn!("Failed to connect to upstream {}: {}", upstream_addr, e);
                 let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                pool.mark_unavailable(socks_port).await;
                 anyhow::bail!("Upstream connection failed: {}", e);
             }
         };
@@ -230,7 +250,6 @@ impl HttpProxyServer {
             Some(addr) => addr,
             None => {
                 writer.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
-                pool.mark_unavailable(socks_port).await;
                 anyhow::bail!("No proxy available for port {}", socks_port);
             }
         };
@@ -242,7 +261,6 @@ impl HttpProxyServer {
             Err(e) => {
                 warn!("Failed to connect to upstream {}: {}", upstream_addr, e);
                 writer.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
-                pool.mark_unavailable(socks_port).await;
                 anyhow::bail!("Upstream connection failed: {}", e);
             }
         };
@@ -365,6 +383,26 @@ fn parse_host_port(s: &str, default_port: u16) -> anyhow::Result<(String, u16)> 
     } else {
         Ok((s.to_string(), default_port))
     }
+}
+
+fn base64_decode(input: &str) -> anyhow::Result<String> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let input = input.trim_end_matches('=');
+    let mut buf = Vec::with_capacity(input.len() * 3 / 4);
+    for chunk in input.as_bytes().chunks(4) {
+        let mut n: u32 = 0;
+        let mut bits = 0;
+        for &c in chunk {
+            let val = TABLE.iter().position(|&b| b == c).ok_or_else(|| anyhow::anyhow!("invalid base64 char"))? as u32;
+            n = (n << 6) | val;
+            bits += 6;
+        }
+        let bytes = bits / 8;
+        for i in (0..bytes).rev() {
+            buf.push((n >> (i * 8)) as u8);
+        }
+    }
+    String::from_utf8(buf).map_err(|e| anyhow::anyhow!("invalid utf8: {}", e))
 }
 
 #[cfg(test)]
